@@ -199,6 +199,97 @@ Rules:
     return await asyncio.to_thread(call_openai)
 
 
+class BoatRegistrationModal(discord.ui.Modal):
+    def __init__(self, boat_type):
+        super().__init__(title="Boat Registration")
+        self.boat_type = boat_type
+
+        self.boat_name = discord.ui.TextInput(
+            label="Boat Name",
+            placeholder="Example: Black Pearl",
+            required=True,
+            max_length=100
+        )
+
+        self.claimed_by = discord.ui.TextInput(
+            label="Claimed By",
+            placeholder="Example: Doggo",
+            required=True,
+            max_length=100
+        )
+
+        self.notes = discord.ui.TextInput(
+            label="Notes",
+            placeholder="Optional",
+            required=False,
+            max_length=300
+        )
+
+        self.add_item(self.boat_name)
+        self.add_item(self.claimed_by)
+        self.add_item(self.notes)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if await block_if_no_access(interaction):
+            return
+
+        notes_value = self.notes.value if self.notes.value else "None"
+
+        cursor.execute("""
+        INSERT INTO boats (boat_name, claimed_by, boat_type, notes)
+        VALUES (%s, %s, %s, %s)
+        """, (
+            self.boat_name.value,
+            self.claimed_by.value,
+            self.boat_type,
+            notes_value
+        ))
+
+        embed = discord.Embed(
+            title="Boat Registered",
+            color=discord.Color.blue()
+        )
+
+        embed.add_field(name="Name", value=self.boat_name.value, inline=False)
+        embed.add_field(name="Claimed By", value=self.claimed_by.value, inline=False)
+        embed.add_field(name="Type", value=self.boat_type, inline=False)
+
+        if notes_value != "None":
+            embed.add_field(name="Notes", value=notes_value, inline=False)
+
+        await interaction.response.send_message(embed=embed)
+
+
+class BoatTypeSelect(discord.ui.Select):
+    def __init__(self):
+        options = [
+            discord.SelectOption(label="Schooner"),
+            discord.SelectOption(label="Brigantine"),
+            discord.SelectOption(label="Galleon")
+        ]
+
+        super().__init__(
+            placeholder="Choose boat type",
+            min_values=1,
+            max_values=1,
+            options=options
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if await block_if_no_access(interaction):
+            return
+
+        await interaction.response.send_modal(
+            BoatRegistrationModal(self.values[0])
+        )
+
+
+class BoatTypeView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=180)
+        self.add_item(BoatTypeSelect())
+
+
 @bot.event
 async def on_ready():
     setup_resources()
@@ -243,27 +334,20 @@ async def doggo(interaction: discord.Interaction, message: str):
 
 
 @bot.tree.command(name="registerboat", description="Register a boat")
-async def registerboat(
-    interaction: discord.Interaction,
-    boat_name: str,
-    claimed_by: str,
-    boat_type: str,
-    notes: str = "None"
-):
+async def registerboat(interaction: discord.Interaction):
     if await block_if_no_access(interaction):
         return
 
-    cursor.execute("""
-    INSERT INTO boats (boat_name, claimed_by, boat_type, notes)
-    VALUES (%s, %s, %s, %s)
-    """, (boat_name, claimed_by, boat_type, notes))
+    embed = discord.Embed(
+        title="Boat Registration",
+        description="Select the boat type below.",
+        color=discord.Color.blue()
+    )
 
     await interaction.response.send_message(
-        f"Boat registered:\n"
-        f"Name: {boat_name}\n"
-        f"Claimed by: {claimed_by}\n"
-        f"Type: {boat_type}\n"
-        f"Notes: {notes}"
+        embed=embed,
+        view=BoatTypeView(),
+        ephemeral=True
     )
 
 
