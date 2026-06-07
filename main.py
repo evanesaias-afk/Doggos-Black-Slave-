@@ -447,7 +447,13 @@ class ResourceCategoryView(discord.ui.View):
 @bot.event
 async def on_ready():
     setup_resources()
-    await bot.tree.sync()
+
+    try:
+        synced = await bot.tree.sync()
+        print(f"Synced {len(synced)} commands", flush=True)
+    except Exception as error:
+        print(f"Sync error: {error}", flush=True)
+
     print(f"{bot.user} is online", flush=True)
 
 
@@ -602,8 +608,8 @@ async def removeboat(interaction: discord.Interaction, boat_name: str):
         await interaction.followup.send(f"Removed boat: {boat_name}")
 
 
-@bot.tree.command(name="updateresource", description="Update one resource with dropdowns")
-async def updateresource(interaction: discord.Interaction):
+@bot.tree.command(name="bulkupdate", description="Update a resource with dropdowns")
+async def bulkupdate(interaction: discord.Interaction):
     if await block_if_no_access(interaction):
         return
 
@@ -620,65 +626,6 @@ async def updateresource(interaction: discord.Interaction):
         view=ResourceCategoryView(),
         ephemeral=True
     )
-
-
-@bot.tree.command(name="bulkupdate", description="Update many resources at once")
-@app_commands.describe(
-    updates="Example: Ironwood=79000, Ash=44000, Gold=150000"
-)
-async def bulkupdate(interaction: discord.Interaction, updates: str):
-    if await block_if_no_access(interaction):
-        return
-
-    await interaction.response.defer()
-
-    lines = updates.replace(",", "\n").split("\n")
-
-    updated = []
-    not_found = []
-
-    for line in lines:
-        if "=" not in line:
-            continue
-
-        name, amount = line.split("=", 1)
-        name = name.strip().lower()
-        amount = amount.strip().replace(",", "")
-
-        if not amount.isdigit():
-            continue
-
-        amount = int(amount)
-
-        cursor.execute("""
-        UPDATE resources
-        SET amount = %s
-        WHERE name = %s
-        """, (amount, name))
-
-        if cursor.rowcount == 0:
-            not_found.append(name.title())
-        else:
-            updated.append(f"{name.title()} = {format_number(amount)}")
-
-    message = "Resource update complete.\n\n"
-
-    if updated:
-        message += "Updated:\n"
-
-        for item in updated:
-            message += f"• {item}\n"
-
-    if not_found:
-        message += "\nNot found:\n"
-
-        for item in not_found:
-            message += f"• {item}\n"
-
-    message += "\n"
-    message += build_low_resource_message(ping=False)
-
-    await interaction.followup.send(message[:2000])
 
 
 @bot.tree.command(name="resources", description="Show all tracked resources")
