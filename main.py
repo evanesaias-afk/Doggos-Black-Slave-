@@ -1,7 +1,7 @@
 import os
-import sqlite3
 import asyncio
 import discord
+import psycopg2
 from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
@@ -11,6 +11,7 @@ load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 PING_ROLE_ID = 1497672922314313979
 ALLOWED_ROLE_ID = 1497672922314313979
@@ -23,12 +24,13 @@ intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-db = sqlite3.connect("atlas_bot.db")
+db = psycopg2.connect(DATABASE_URL)
+db.autocommit = True
 cursor = db.cursor()
 
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS boats (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id SERIAL PRIMARY KEY,
     boat_name TEXT NOT NULL,
     claimed_by TEXT NOT NULL,
     boat_type TEXT NOT NULL,
@@ -44,8 +46,6 @@ CREATE TABLE IF NOT EXISTS resources (
     amount INTEGER NOT NULL DEFAULT 0
 )
 """)
-
-db.commit()
 
 DEFAULT_RESOURCES = {
     "Wood": {
@@ -106,17 +106,16 @@ def setup_resources():
     for category, data in DEFAULT_RESOURCES.items():
         for item in data["items"]:
             cursor.execute("""
-            INSERT OR IGNORE INTO resources (name, category, goal, amount)
-            VALUES (?, ?, ?, 0)
+            INSERT INTO resources (name, category, goal, amount)
+            VALUES (%s, %s, %s, 0)
+            ON CONFLICT (name) DO NOTHING
             """, (item.lower(), category, data["goal"]))
 
     cursor.execute("""
     UPDATE resources
-    SET category = ?, goal = ?
-    WHERE name = ?
+    SET category = %s, goal = %s
+    WHERE name = %s
     """, ("Gold", 200000, "gold"))
-
-    db.commit()
 
 
 def format_number(num):
@@ -192,12 +191,9 @@ Rules:
     def call_openai():
         response = openai_client.chat.completions.create(
             model="gpt-4.1-mini",
-            messages=[
-                {"role": "user", "content": prompt}
-            ],
+            messages=[{"role": "user", "content": prompt}],
             max_tokens=120
         )
-
         return response.choices[0].message.content.strip()
 
     return await asyncio.to_thread(call_openai)
@@ -215,24 +211,14 @@ async def on_message(message):
     if message.author.bot:
         return
 
-    print(f"Message received: {message.content}", flush=True)
-
     if message.reference and message.reference.message_id:
-        print("Reply detected", flush=True)
-
         try:
             replied_message = await message.channel.fetch_message(
                 message.reference.message_id
             )
 
-            print(f"Replied to author ID: {replied_message.author.id}", flush=True)
-            print(f"Bot ID: {bot.user.id}", flush=True)
-
             if replied_message.author.id == bot.user.id:
-                print("Reply was to this bot", flush=True)
-
                 if not has_access(message.author):
-                    print("User failed access check", flush=True)
                     return
 
                 async with message.channel.typing():
@@ -252,9 +238,7 @@ async def doggo(interaction: discord.Interaction, message: str):
         return
 
     await interaction.response.defer()
-
     reply = await make_doggo_reply(message)
-
     await interaction.followup.send(reply)
 
 
@@ -271,10 +255,8 @@ async def registerboat(
 
     cursor.execute("""
     INSERT INTO boats (boat_name, claimed_by, boat_type, notes)
-    VALUES (?, ?, ?, ?)
+    VALUES (%s, %s, %s, %s)
     """, (boat_name, claimed_by, boat_type, notes))
-
-    db.commit()
 
     await interaction.response.send_message(
         f"Boat registered:\n"
@@ -333,7 +315,7 @@ async def boatsby(interaction: discord.Interaction, claimed_by: str):
     cursor.execute("""
     SELECT boat_name, boat_type, notes
     FROM boats
-    WHERE lower(claimed_by) = ?
+    WHERE lower(claimed_by) = %s
     ORDER BY boat_name
     """, (claimed_by.lower(),))
 
@@ -363,8 +345,10 @@ async def removeboat(interaction: discord.Interaction, boat_name: str):
     if await block_if_no_access(interaction):
         return
 
-    cursor.execute("DELETE FROM boats WHERE lower(boat_name) = ?", (boat_name.lower(),))
-    db.commit()
+    cursor.execute(
+        "DELETE FROM boats WHERE lower(boat_name) = %s",
+        (boat_name.lower(),)
+    )
 
     if cursor.rowcount == 0:
         await interaction.response.send_message("Boat not found.")
@@ -400,16 +384,14 @@ async def bulkupdate(interaction: discord.Interaction, updates: str):
 
         cursor.execute("""
         UPDATE resources
-        SET amount = ?
-        WHERE name = ?
+        SET amount = %s
+        WHERE name = %s
         """, (amount, name))
 
         if cursor.rowcount == 0:
             not_found.append(name.title())
         else:
             updated.append(f"{name.title()} = {format_number(amount)}")
-
-    db.commit()
 
     message = "Resource update complete.\n\n"
 
@@ -466,7 +448,9 @@ async def lowresources(interaction: discord.Interaction):
     if await block_if_no_access(interaction):
         return
 
-    await interaction.response.send_message(build_low_resource_message(ping=False)[:2000])
+    await interaction.response.send_message(
+        build_low_resource_message(ping=False)[:2000]
+    )
 
 
 @bot.tree.command(name="pinglowresources", description="Ping company members for low resources")
@@ -491,11 +475,9 @@ async def setresourcegoal(
 
     cursor.execute("""
     UPDATE resources
-    SET goal = ?
-    WHERE name = ?
+    SET goal = %s
+    WHERE name = %s
     """, (goal, resource_name.lower()))
-
-    db.commit()
 
     if cursor.rowcount == 0:
         await interaction.response.send_message("Resource not found.")
