@@ -449,8 +449,17 @@ async def on_ready():
     setup_resources()
 
     try:
-        synced = await bot.tree.sync()
-        print(f"Synced {len(synced)} commands", flush=True)
+        global_synced = await bot.tree.sync()
+        print(f"Global synced {len(global_synced)} commands", flush=True)
+
+        for guild in bot.guilds:
+            bot.tree.copy_global_to(guild=guild)
+            guild_synced = await bot.tree.sync(guild=guild)
+            print(
+                f"Guild synced {len(guild_synced)} commands to {guild.name} ({guild.id})",
+                flush=True
+            )
+
     except Exception as error:
         print(f"Sync error: {error}", flush=True)
 
