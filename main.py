@@ -95,10 +95,17 @@ async def block_if_no_access(interaction):
     if has_access(interaction):
         return False
 
-    await interaction.response.send_message(
-        "You do not have permission to use this bot.",
-        ephemeral=True
-    )
+    if interaction.response.is_done():
+        await interaction.followup.send(
+            "You do not have permission to use this bot.",
+            ephemeral=True
+        )
+    else:
+        await interaction.response.send_message(
+            "You do not have permission to use this bot.",
+            ephemeral=True
+        )
+
     return True
 
 
@@ -230,8 +237,14 @@ class BoatRegistrationModal(discord.ui.Modal):
         self.add_item(self.notes)
 
     async def on_submit(self, interaction: discord.Interaction):
-        if await block_if_no_access(interaction):
+        if not has_access(interaction):
+            await interaction.response.send_message(
+                "You do not have permission to use this bot.",
+                ephemeral=True
+            )
             return
+
+        await interaction.response.defer(ephemeral=True)
 
         notes_value = self.notes.value if self.notes.value else "None"
 
@@ -257,7 +270,7 @@ class BoatRegistrationModal(discord.ui.Modal):
         if notes_value != "None":
             embed.add_field(name="Notes", value=notes_value, inline=False)
 
-        await interaction.response.send_message(embed=embed)
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 class BoatTypeSelect(discord.ui.Select):
@@ -338,13 +351,15 @@ async def registerboat(interaction: discord.Interaction):
     if await block_if_no_access(interaction):
         return
 
+    await interaction.response.defer(ephemeral=True)
+
     embed = discord.Embed(
         title="Boat Registration",
         description="Select the boat type below.",
         color=discord.Color.blue()
     )
 
-    await interaction.response.send_message(
+    await interaction.followup.send(
         embed=embed,
         view=BoatTypeView(),
         ephemeral=True
@@ -448,6 +463,8 @@ async def bulkupdate(interaction: discord.Interaction, updates: str):
     if await block_if_no_access(interaction):
         return
 
+    await interaction.response.defer()
+
     lines = updates.replace(",", "\n").split("\n")
 
     updated = []
@@ -494,13 +511,15 @@ async def bulkupdate(interaction: discord.Interaction, updates: str):
     message += "\n"
     message += build_low_resource_message(ping=False)
 
-    await interaction.response.send_message(message[:2000])
+    await interaction.followup.send(message[:2000])
 
 
 @bot.tree.command(name="resources", description="Show all tracked resources")
 async def resources(interaction: discord.Interaction):
     if await block_if_no_access(interaction):
         return
+
+    await interaction.response.defer()
 
     cursor.execute("""
     SELECT name, category, goal, amount
@@ -524,7 +543,7 @@ async def resources(interaction: discord.Interaction):
 
         message += "\n"
 
-    await interaction.response.send_message(message[:2000])
+    await interaction.followup.send(message[:2000])
 
 
 @bot.tree.command(name="lowresources", description="Show resources below goal")
@@ -532,7 +551,9 @@ async def lowresources(interaction: discord.Interaction):
     if await block_if_no_access(interaction):
         return
 
-    await interaction.response.send_message(
+    await interaction.response.defer()
+
+    await interaction.followup.send(
         build_low_resource_message(ping=False)[:2000]
     )
 
@@ -542,7 +563,9 @@ async def pinglowresources(interaction: discord.Interaction):
     if await block_if_no_access(interaction):
         return
 
-    await interaction.response.send_message(
+    await interaction.response.defer()
+
+    await interaction.followup.send(
         build_low_resource_message(ping=True)[:2000],
         allowed_mentions=discord.AllowedMentions(roles=True)
     )
@@ -557,6 +580,8 @@ async def setresourcegoal(
     if await block_if_no_access(interaction):
         return
 
+    await interaction.response.defer()
+
     cursor.execute("""
     UPDATE resources
     SET goal = %s
@@ -564,9 +589,9 @@ async def setresourcegoal(
     """, (goal, resource_name.lower()))
 
     if cursor.rowcount == 0:
-        await interaction.response.send_message("Resource not found.")
+        await interaction.followup.send("Resource not found.")
     else:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"{resource_name.title()} goal set to {format_number(goal)}."
         )
 
