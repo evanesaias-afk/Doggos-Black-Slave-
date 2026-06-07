@@ -78,6 +78,9 @@ def has_access(target):
     if not hasattr(user, "roles"):
         return False
 
+    if user.guild_permissions.administrator:
+        return True
+
     return any(role.id == ALLOWED_ROLE_ID for role in user.roles)
 
 
@@ -276,6 +279,39 @@ async def boats(interaction: discord.Interaction):
                 message += f", {notes}"
 
             message += "\n"
+
+        message += "\n"
+
+    await interaction.response.send_message(message[:2000])
+
+
+@bot.tree.command(name="boatsby", description="Show boats claimed by a person")
+async def boatsby(interaction: discord.Interaction, claimed_by: str):
+    if await block_if_no_access(interaction):
+        return
+
+    cursor.execute("""
+    SELECT boat_name, boat_type, notes
+    FROM boats
+    WHERE lower(claimed_by) = ?
+    ORDER BY boat_name
+    """, (claimed_by.lower(),))
+
+    rows = cursor.fetchall()
+
+    if not rows:
+        await interaction.response.send_message(
+            f"No boats found for {claimed_by}."
+        )
+        return
+
+    message = f"BOATS CLAIMED BY {claimed_by}\n\n"
+
+    for boat_name, boat_type, notes in rows:
+        message += f"• {boat_name}, {boat_type}"
+
+        if notes and notes != "None":
+            message += f", {notes}"
 
         message += "\n"
 
