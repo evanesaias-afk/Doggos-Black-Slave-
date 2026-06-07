@@ -303,6 +303,147 @@ class BoatTypeView(discord.ui.View):
         self.add_item(BoatTypeSelect())
 
 
+class ResourceAmountModal(discord.ui.Modal):
+    def __init__(self, resource_name):
+        super().__init__(title=f"Update {resource_name.title()}")
+        self.resource_name = resource_name
+
+        self.amount = discord.ui.TextInput(
+            label="Amount",
+            placeholder="Example: 79000",
+            required=True,
+            max_length=20
+        )
+
+        self.add_item(self.amount)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not has_access(interaction):
+            await interaction.response.send_message(
+                "You do not have permission to use this bot.",
+                ephemeral=True
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        amount_text = self.amount.value.replace(",", "").strip()
+
+        if not amount_text.isdigit():
+            await interaction.followup.send(
+                "Enter numbers only.",
+                ephemeral=True
+            )
+            return
+
+        amount = int(amount_text)
+
+        cursor.execute("""
+        UPDATE resources
+        SET amount = %s
+        WHERE name = %s
+        """, (amount, self.resource_name.lower()))
+
+        if cursor.rowcount == 0:
+            await interaction.followup.send(
+                "Resource not found.",
+                ephemeral=True
+            )
+            return
+
+        cursor.execute("""
+        SELECT goal
+        FROM resources
+        WHERE name = %s
+        """, (self.resource_name.lower(),))
+
+        row = cursor.fetchone()
+        goal = row[0] if row else 0
+        needed = max(goal - amount, 0)
+
+        embed = discord.Embed(
+            title="Resource Updated",
+            color=discord.Color.green()
+        )
+
+        embed.add_field(name="Resource", value=self.resource_name.title(), inline=False)
+        embed.add_field(name="Amount", value=format_number(amount), inline=False)
+        embed.add_field(name="Goal", value=format_number(goal), inline=False)
+        embed.add_field(name="Still Needed", value=format_number(needed), inline=False)
+
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+class ResourceSelect(discord.ui.Select):
+    def __init__(self, category):
+        self.category = category
+
+        options = [
+            discord.SelectOption(label=item)
+            for item in DEFAULT_RESOURCES[category]["items"]
+        ]
+
+        super().__init__(
+            placeholder=f"Choose {category} resource",
+            min_values=1,
+            max_values=1,
+            options=options
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if await block_if_no_access(interaction):
+            return
+
+        await interaction.response.send_modal(
+            ResourceAmountModal(self.values[0])
+        )
+
+
+class ResourceSelectView(discord.ui.View):
+    def __init__(self, category):
+        super().__init__(timeout=180)
+        self.add_item(ResourceSelect(category))
+
+
+class ResourceCategorySelect(discord.ui.Select):
+    def __init__(self):
+        options = [
+            discord.SelectOption(label=category)
+            for category in DEFAULT_RESOURCES.keys()
+        ]
+
+        super().__init__(
+            placeholder="Choose resource category",
+            min_values=1,
+            max_values=1,
+            options=options
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if await block_if_no_access(interaction):
+            return
+
+        category = self.values[0]
+
+        embed = discord.Embed(
+            title=f"{category} Resources",
+            description=f"Choose which {category} resource to update.",
+            color=discord.Color.green()
+        )
+
+        await interaction.response.send_message(
+            embed=embed,
+            view=ResourceSelectView(category),
+            ephemeral=True
+        )
+
+
+class ResourceCategoryView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=180)
+        self.add_item(ResourceCategorySelect())
+
+
 @bot.event
 async def on_ready():
     setup_resources()
@@ -371,6 +512,8 @@ async def boats(interaction: discord.Interaction):
     if await block_if_no_access(interaction):
         return
 
+    await interaction.response.defer()
+
     cursor.execute("""
     SELECT boat_name, claimed_by, boat_type, notes
     FROM boats
@@ -380,7 +523,7 @@ async def boats(interaction: discord.Interaction):
     rows = cursor.fetchall()
 
     if not rows:
-        await interaction.response.send_message("No boats registered yet.")
+        await interaction.followup.send("No boats registered yet.")
         return
 
     grouped = {}
@@ -403,13 +546,15 @@ async def boats(interaction: discord.Interaction):
 
         message += "\n"
 
-    await interaction.response.send_message(message[:2000])
+    await interaction.followup.send(message[:2000])
 
 
 @bot.tree.command(name="boatsby", description="Show boats claimed by a person")
 async def boatsby(interaction: discord.Interaction, claimed_by: str):
     if await block_if_no_access(interaction):
         return
+
+    await interaction.response.defer()
 
     cursor.execute("""
     SELECT boat_name, boat_type, notes
@@ -421,7 +566,7 @@ async def boatsby(interaction: discord.Interaction, claimed_by: str):
     rows = cursor.fetchall()
 
     if not rows:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"No boats found for {claimed_by}."
         )
         return
@@ -436,7 +581,7 @@ async def boatsby(interaction: discord.Interaction, claimed_by: str):
 
         message += "\n"
 
-    await interaction.response.send_message(message[:2000])
+    await interaction.followup.send(message[:2000])
 
 
 @bot.tree.command(name="removeboat", description="Remove a boat by name")
@@ -444,15 +589,37 @@ async def removeboat(interaction: discord.Interaction, boat_name: str):
     if await block_if_no_access(interaction):
         return
 
+    await interaction.response.defer()
+
     cursor.execute(
         "DELETE FROM boats WHERE lower(boat_name) = %s",
         (boat_name.lower(),)
     )
 
     if cursor.rowcount == 0:
-        await interaction.response.send_message("Boat not found.")
+        await interaction.followup.send("Boat not found.")
     else:
-        await interaction.response.send_message(f"Removed boat: {boat_name}")
+        await interaction.followup.send(f"Removed boat: {boat_name}")
+
+
+@bot.tree.command(name="updateresource", description="Update one resource with dropdowns")
+async def updateresource(interaction: discord.Interaction):
+    if await block_if_no_access(interaction):
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    embed = discord.Embed(
+        title="Update Resource",
+        description="Choose a category, then choose the resource. After that, enter the number.",
+        color=discord.Color.green()
+    )
+
+    await interaction.followup.send(
+        embed=embed,
+        view=ResourceCategoryView(),
+        ephemeral=True
+    )
 
 
 @bot.tree.command(name="bulkupdate", description="Update many resources at once")
