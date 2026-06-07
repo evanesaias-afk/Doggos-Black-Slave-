@@ -10,13 +10,16 @@ from openai import OpenAI
 load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
 PING_ROLE_ID = 1497672922314313979
 ALLOWED_ROLE_ID = 1497672922314313979
 
-openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
 intents = discord.Intents.default()
 intents.message_content = True
+intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
@@ -68,6 +71,10 @@ DEFAULT_RESOURCES = {
     "Hide": {
         "goal": 50000,
         "items": ["Fleece", "Fur", "Hair", "Leather", "Pelt", "Skin"]
+    },
+    "Gold": {
+        "goal": 200000,
+        "items": ["Gold"]
     }
 }
 
@@ -102,6 +109,12 @@ def setup_resources():
             INSERT OR IGNORE INTO resources (name, category, goal, amount)
             VALUES (?, ?, ?, 0)
             """, (item.lower(), category, data["goal"]))
+
+    cursor.execute("""
+    UPDATE resources
+    SET category = ?, goal = ?
+    WHERE name = ?
+    """, ("Gold", 200000, "gold"))
 
     db.commit()
 
@@ -155,6 +168,9 @@ def build_low_resource_message(ping=False):
 
 
 async def make_doggo_reply(user_message):
+    if not OPENAI_API_KEY:
+        return "Doggo is still the best Atlas land PvPer alive, but the OpenAI key is missing."
+
     prompt = f"""
 You are a funny Atlas game Discord bot.
 
@@ -191,7 +207,7 @@ Rules:
 async def on_ready():
     setup_resources()
     await bot.tree.sync()
-    print(f"{bot.user} is online")
+    print(f"{bot.user} is online", flush=True)
 
 
 @bot.event
@@ -199,23 +215,47 @@ async def on_message(message):
     if message.author.bot:
         return
 
-    if message.reference:
+    print(f"Message received: {message.content}", flush=True)
+
+    if message.reference and message.reference.message_id:
+        print("Reply detected", flush=True)
+
         try:
             replied_message = await message.channel.fetch_message(
                 message.reference.message_id
             )
 
+            print(f"Replied to author ID: {replied_message.author.id}", flush=True)
+            print(f"Bot ID: {bot.user.id}", flush=True)
+
             if replied_message.author.id == bot.user.id:
+                print("Reply was to this bot", flush=True)
+
                 if not has_access(message.author):
+                    print("User failed access check", flush=True)
                     return
 
-                reply = await make_doggo_reply(message.content)
+                async with message.channel.typing():
+                    reply = await make_doggo_reply(message.content)
+
                 await message.reply(reply)
 
         except Exception as error:
-            print(error)
+            print(f"Reply handler error: {error}", flush=True)
 
     await bot.process_commands(message)
+
+
+@bot.tree.command(name="doggo", description="Make the bot glaze Doggo")
+async def doggo(interaction: discord.Interaction, message: str):
+    if await block_if_no_access(interaction):
+        return
+
+    await interaction.response.defer()
+
+    reply = await make_doggo_reply(message)
+
+    await interaction.followup.send(reply)
 
 
 @bot.tree.command(name="registerboat", description="Register a boat")
@@ -334,7 +374,7 @@ async def removeboat(interaction: discord.Interaction, boat_name: str):
 
 @bot.tree.command(name="bulkupdate", description="Update many resources at once")
 @app_commands.describe(
-    updates="Example: Ironwood=79000, Ash=44000, Tin=16000"
+    updates="Example: Ironwood=79000, Ash=44000, Gold=150000"
 )
 async def bulkupdate(interaction: discord.Interaction, updates: str):
     if await block_if_no_access(interaction):
