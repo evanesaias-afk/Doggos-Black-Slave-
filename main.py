@@ -305,7 +305,7 @@ class BoatTypeView(discord.ui.View):
 
 class ResourceAmountModal(discord.ui.Modal):
     def __init__(self, resource_name):
-        super().__init__(title=f"Update {resource_name.title()}")
+        super().__init__(title="Update Resource")
         self.resource_name = resource_name
 
         self.amount = discord.ui.TextInput(
@@ -379,7 +379,10 @@ class ResourceSelect(discord.ui.Select):
         self.category = category
 
         options = [
-            discord.SelectOption(label=item)
+            discord.SelectOption(
+                label=item,
+                value=item.lower()
+            )
             for item in DEFAULT_RESOURCES[category]["items"]
         ]
 
@@ -391,13 +394,18 @@ class ResourceSelect(discord.ui.Select):
         )
 
     async def callback(self, interaction: discord.Interaction):
-        if await block_if_no_access(interaction):
+        if not has_access(interaction):
+            await interaction.response.send_message(
+                "You do not have permission to use this bot.",
+                ephemeral=True
+            )
             return
 
-        await interaction.response.send_modal(
-            ResourceAmountModal(self.values[0])
-        )
+        resource_name = self.values[0]
 
+        await interaction.response.send_modal(
+            ResourceAmountModal(resource_name)
+        )
 
 class ResourceSelectView(discord.ui.View):
     def __init__(self, category):
@@ -420,7 +428,11 @@ class ResourceCategorySelect(discord.ui.Select):
         )
 
     async def callback(self, interaction: discord.Interaction):
-        if await block_if_no_access(interaction):
+        if not has_access(interaction):
+            await interaction.response.send_message(
+                "You do not have permission to use this bot.",
+                ephemeral=True
+            )
             return
 
         category = self.values[0]
@@ -436,7 +448,6 @@ class ResourceCategorySelect(discord.ui.Select):
             view=ResourceSelectView(category),
             ephemeral=True
         )
-
 
 class ResourceCategoryView(discord.ui.View):
     def __init__(self):
