@@ -1,16 +1,23 @@
 import os
 import sqlite3
+import asyncio
 import discord
 from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
+from openai import OpenAI
 
 load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 PING_ROLE_ID = 1497672922314313979
+ALLOWED_ROLE_ID = 1497672922314313979
+
+openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 intents = discord.Intents.default()
+intents.message_content = True
+
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 db = sqlite3.connect("atlas_bot.db")
@@ -36,7 +43,6 @@ CREATE TABLE IF NOT EXISTS resources (
 """)
 
 db.commit()
-
 
 DEFAULT_RESOURCES = {
     "Wood": {
@@ -66,6 +72,26 @@ DEFAULT_RESOURCES = {
 }
 
 
+def has_access(target):
+    user = target.user if hasattr(target, "user") else target
+
+    if not hasattr(user, "roles"):
+        return False
+
+    return any(role.id == ALLOWED_ROLE_ID for role in user.roles)
+
+
+async def block_if_no_access(interaction):
+    if has_access(interaction):
+        return False
+
+    await interaction.response.send_message(
+        "You do not have permission to use this bot.",
+        ephemeral=True
+    )
+    return True
+
+
 def setup_resources():
     for category, data in DEFAULT_RESOURCES.items():
         for item in data["items"]:
@@ -73,6 +99,7 @@ def setup_resources():
             INSERT OR IGNORE INTO resources (name, category, goal, amount)
             VALUES (?, ?, ?, 0)
             """, (item.lower(), category, data["goal"]))
+
     db.commit()
 
 
@@ -87,6 +114,7 @@ def get_low_resources():
     WHERE amount < goal
     ORDER BY category, name
     """)
+
     return cursor.fetchall()
 
 
@@ -123,11 +151,68 @@ def build_low_resource_message(ping=False):
     return message
 
 
+async def make_doggo_reply(user_message):
+    prompt = f"""
+You are a funny Atlas game Discord bot.
+
+Someone replied to the bot with this:
+"{user_message}"
+
+Reply based on what they said.
+
+Rules:
+- Make the reply Atlas-themed.
+- Glaze Doggo as the best Atlas land PvPer.
+- Mention land PvP, beds, bolas, bears, carbines, kits, islands, grids, raids, claim towers, puckles, or farming when it fits.
+- Keep it 1 to 3 sentences.
+- Make it funny.
+- Do not be mean in a real-life way.
+- Do not use slurs.
+"""
+
+    def call_openai():
+        response = openai_client.chat.completions.create(
+            model="gpt-4.1-mini",
+            messages=[
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=120
+        )
+
+        return response.choices[0].message.content.strip()
+
+    return await asyncio.to_thread(call_openai)
+
+
 @bot.event
 async def on_ready():
     setup_resources()
     await bot.tree.sync()
     print(f"{bot.user} is online")
+
+
+@bot.event
+async def on_message(message):
+    if message.author.bot:
+        return
+
+    if message.reference:
+        try:
+            replied_message = await message.channel.fetch_message(
+                message.reference.message_id
+            )
+
+            if replied_message.author.id == bot.user.id:
+                if not has_access(message.author):
+                    return
+
+                reply = await make_doggo_reply(message.content)
+                await message.reply(reply)
+
+        except Exception as error:
+            print(error)
+
+    await bot.process_commands(message)
 
 
 @bot.tree.command(name="registerboat", description="Register a boat")
@@ -138,6 +223,9 @@ async def registerboat(
     boat_type: str,
     notes: str = "None"
 ):
+    if await block_if_no_access(interaction):
+        return
+
     cursor.execute("""
     INSERT INTO boats (boat_name, claimed_by, boat_type, notes)
     VALUES (?, ?, ?, ?)
@@ -156,6 +244,9 @@ async def registerboat(
 
 @bot.tree.command(name="boats", description="Show all registered boats")
 async def boats(interaction: discord.Interaction):
+    if await block_if_no_access(interaction):
+        return
+
     cursor.execute("""
     SELECT boat_name, claimed_by, boat_type, notes
     FROM boats
@@ -180,8 +271,10 @@ async def boats(interaction: discord.Interaction):
 
         for boat_name, boat_type, notes in boats_list:
             message += f"• {boat_name}, {boat_type}"
+
             if notes and notes != "None":
                 message += f", {notes}"
+
             message += "\n"
 
         message += "\n"
@@ -191,6 +284,9 @@ async def boats(interaction: discord.Interaction):
 
 @bot.tree.command(name="removeboat", description="Remove a boat by name")
 async def removeboat(interaction: discord.Interaction, boat_name: str):
+    if await block_if_no_access(interaction):
+        return
+
     cursor.execute("DELETE FROM boats WHERE lower(boat_name) = ?", (boat_name.lower(),))
     db.commit()
 
@@ -205,6 +301,9 @@ async def removeboat(interaction: discord.Interaction, boat_name: str):
     updates="Example: Ironwood=79000, Ash=44000, Tin=16000"
 )
 async def bulkupdate(interaction: discord.Interaction, updates: str):
+    if await block_if_no_access(interaction):
+        return
+
     lines = updates.replace(",", "\n").split("\n")
 
     updated = []
@@ -240,11 +339,13 @@ async def bulkupdate(interaction: discord.Interaction, updates: str):
 
     if updated:
         message += "Updated:\n"
+
         for item in updated:
             message += f"• {item}\n"
 
     if not_found:
         message += "\nNot found:\n"
+
         for item in not_found:
             message += f"• {item}\n"
 
@@ -256,6 +357,9 @@ async def bulkupdate(interaction: discord.Interaction, updates: str):
 
 @bot.tree.command(name="resources", description="Show all tracked resources")
 async def resources(interaction: discord.Interaction):
+    if await block_if_no_access(interaction):
+        return
+
     cursor.execute("""
     SELECT name, category, goal, amount
     FROM resources
@@ -263,7 +367,6 @@ async def resources(interaction: discord.Interaction):
     """)
 
     rows = cursor.fetchall()
-
     grouped = {}
 
     for name, category, goal, amount in rows:
@@ -284,16 +387,32 @@ async def resources(interaction: discord.Interaction):
 
 @bot.tree.command(name="lowresources", description="Show resources below goal")
 async def lowresources(interaction: discord.Interaction):
+    if await block_if_no_access(interaction):
+        return
+
     await interaction.response.send_message(build_low_resource_message(ping=False)[:2000])
 
 
 @bot.tree.command(name="pinglowresources", description="Ping company members for low resources")
 async def pinglowresources(interaction: discord.Interaction):
-    await interaction.response.send_message(build_low_resource_message(ping=True)[:2000])
+    if await block_if_no_access(interaction):
+        return
+
+    await interaction.response.send_message(
+        build_low_resource_message(ping=True)[:2000],
+        allowed_mentions=discord.AllowedMentions(roles=True)
+    )
 
 
 @bot.tree.command(name="setresourcegoal", description="Change the goal for a resource")
-async def setresourcegoal(interaction: discord.Interaction, resource_name: str, goal: int):
+async def setresourcegoal(
+    interaction: discord.Interaction,
+    resource_name: str,
+    goal: int
+):
+    if await block_if_no_access(interaction):
+        return
+
     cursor.execute("""
     UPDATE resources
     SET goal = ?
