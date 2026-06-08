@@ -1,8 +1,11 @@
 import os
 import asyncio
+import base64
+import json
+import re
+
 import discord
 import psycopg2
-from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -62,7 +65,11 @@ DEFAULT_RESOURCES = {
     },
     "Metal": {
         "goal": 100000,
-        "items": ["Cobalt", "Copper", "Iridium", "Iron", "Silver", "Tin"]
+        "items": [
+            "Cobalt", "Copper", "Iridium", "Iron", "Silver", "Tin",
+            "Cobalt Ingot", "Copper Ingot", "Iridium Ingot",
+            "Iron Ingot", "Silver Ingot", "Tin Ingot"
+        ]
     },
     "Stone": {
         "goal": 10000,
@@ -72,11 +79,48 @@ DEFAULT_RESOURCES = {
         "goal": 50000,
         "items": ["Fleece", "Fur", "Hair", "Leather", "Pelt", "Skin"]
     },
+    "Keratin": {
+        "goal": 50000,
+        "items": ["Bone", "Carapace", "Chitin", "Scale", "Turtle Shell", "Residue"]
+    },
     "Gold": {
         "goal": 200000,
         "items": ["Gold"]
     }
 }
+
+INGOT_RESOURCES = {
+    "cobalt ingot",
+    "copper ingot",
+    "iridium ingot",
+    "iron ingot",
+    "silver ingot",
+    "tin ingot"
+}
+
+
+async def delete_after_two_minutes(message):
+    await asyncio.sleep(120)
+
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+
+async def send_temp_followup(interaction, content=None, **kwargs):
+    message = await interaction.followup.send(content, **kwargs)
+
+    if not kwargs.get("ephemeral", False):
+        asyncio.create_task(delete_after_two_minutes(message))
+
+    return message
+
+
+async def send_temp_reply(message, content):
+    sent = await message.reply(content)
+    asyncio.create_task(delete_after_two_minutes(sent))
+    return sent
 
 
 def has_access(target):
@@ -109,14 +153,64 @@ async def block_if_no_access(interaction):
     return True
 
 
+def clean_key(value):
+    value = value.lower().strip()
+    value = value.replace("_", " ")
+    value = re.sub(r"[^a-z0-9 ]+", "", value)
+    value = re.sub(r"\s+", " ", value)
+    return value
+
+
+def build_resource_lookup():
+    lookup = {}
+
+    for data in DEFAULT_RESOURCES.values():
+        for item in data["items"]:
+            lookup[clean_key(item)] = item.lower()
+
+    aliases = {
+        "bones": "bone",
+        "carapaces": "carapace",
+        "chitins": "chitin",
+        "scales": "scale",
+        "turtle shells": "turtle shell",
+        "residues": "residue",
+        "cobalt ingots": "cobalt ingot",
+        "copper ingots": "copper ingot",
+        "iridium ingots": "iridium ingot",
+        "iron ingots": "iron ingot",
+        "silver ingots": "silver ingot",
+        "tin ingots": "tin ingot"
+    }
+
+    for alias, real_name in aliases.items():
+        lookup[clean_key(alias)] = real_name
+
+    return lookup
+
+
+def get_all_tracked_resource_names():
+    names = []
+
+    for data in DEFAULT_RESOURCES.values():
+        names.extend(data["items"])
+
+    return names
+
+
 def setup_resources():
     for category, data in DEFAULT_RESOURCES.items():
         for item in data["items"]:
+            name = item.lower()
+            goal = 50000 if name in INGOT_RESOURCES else data["goal"]
+
             cursor.execute("""
             INSERT INTO resources (name, category, goal, amount)
             VALUES (%s, %s, %s, 0)
-            ON CONFLICT (name) DO NOTHING
-            """, (item.lower(), category, data["goal"]))
+            ON CONFLICT (name) DO UPDATE
+            SET category = EXCLUDED.category,
+                goal = EXCLUDED.goal
+            """, (name, category, goal))
 
     cursor.execute("""
     UPDATE resources
@@ -136,7 +230,6 @@ def get_low_resources():
     WHERE amount < goal
     ORDER BY category, name
     """)
-
     return cursor.fetchall()
 
 
@@ -164,13 +257,31 @@ def build_low_resource_message(ping=False):
         for name, goal, amount in items:
             needed = goal - amount
             message += (
-                f"• {name}: {format_number(amount)} / {format_number(goal)} "
+                f"â¢ {name}: {format_number(amount)} / {format_number(goal)} "
                 f"Need {format_number(needed)}\n"
             )
 
         message += "\n"
 
     return message
+
+
+def split_message(message, limit=1900):
+    chunks = []
+
+    while len(message) > limit:
+        split_at = message.rfind("\n", 0, limit)
+
+        if split_at == -1:
+            split_at = limit
+
+        chunks.append(message[:split_at])
+        message = message[split_at:].lstrip()
+
+    if message:
+        chunks.append(message)
+
+    return chunks
 
 
 async def make_doggo_reply(user_message):
@@ -204,6 +315,121 @@ Rules:
         return response.choices[0].message.content.strip()
 
     return await asyncio.to_thread(call_openai)
+
+
+def parse_json_from_ai(text):
+    text = text.strip()
+
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?", "", text, flags=re.IGNORECASE).strip()
+        text = re.sub(r"```$", "", text).strip()
+
+    start = text.find("{")
+    end = text.rfind("}")
+
+    if start == -1 or end == -1:
+        raise ValueError("No JSON object found in AI response.")
+
+    return json.loads(text[start:end + 1])
+
+
+async def scan_resource_image(image_bytes, content_type):
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY is missing.")
+
+    encoded_image = base64.b64encode(image_bytes).decode("utf-8")
+    data_url = f"data:{content_type};base64,{encoded_image}"
+
+    tracked_names = get_all_tracked_resource_names()
+
+    prompt = f"""
+You are reading an Atlas game warehouse resource screenshot.
+
+Extract only resource names and amounts visible in the image.
+
+Tracked resource names:
+{", ".join(tracked_names)}
+
+Rules:
+- Return JSON only.
+- Use this exact shape:
+{{
+  "resources": [
+    {{"name": "Hemp", "amount": 349750}},
+    {{"name": "Tin Ingot", "amount": 12345}}
+  ]
+}}
+- Amounts must be integers.
+- Remove commas from numbers.
+- Do not invent missing resources.
+- Do not include item weights, stacks, levels, or anything that is not a resource amount.
+- Match resource names as closely as possible to the tracked names.
+- The category named Keratin contains Bone, Carapace, Chitin, Scale, Turtle Shell, and Residue.
+- Do not include a resource named Keratin unless it is visibly listed in the screenshot as an item.
+"""
+
+    def call_openai():
+        response = openai_client.chat.completions.create(
+            model="gpt-4.1-mini",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": data_url
+                            }
+                        }
+                    ]
+                }
+            ],
+            max_tokens=1200
+        )
+        return response.choices[0].message.content.strip()
+
+    raw_response = await asyncio.to_thread(call_openai)
+    return parse_json_from_ai(raw_response)
+
+
+def update_resources_from_scan(scan_data):
+    lookup = build_resource_lookup()
+    updated = []
+    not_tracked = []
+    invalid = []
+
+    for item in scan_data.get("resources", []):
+        raw_name = str(item.get("name", "")).strip()
+        raw_amount = item.get("amount")
+
+        if not raw_name:
+            continue
+
+        try:
+            amount = int(str(raw_amount).replace(",", "").strip())
+        except Exception:
+            invalid.append(raw_name)
+            continue
+
+        db_name = lookup.get(clean_key(raw_name))
+
+        if not db_name:
+            not_tracked.append(raw_name)
+            continue
+
+        cursor.execute("""
+        UPDATE resources
+        SET amount = %s
+        WHERE name = %s
+        """, (amount, db_name))
+
+        if cursor.rowcount == 0:
+            not_tracked.append(raw_name)
+        else:
+            updated.append((db_name.title(), amount))
+
+    return updated, not_tracked, invalid
 
 
 class BoatRegistrationModal(discord.ui.Modal):
@@ -262,7 +488,6 @@ class BoatRegistrationModal(discord.ui.Modal):
             title="Boat Registered",
             color=discord.Color.blue()
         )
-
         embed.add_field(name="Name", value=self.boat_name.value, inline=False)
         embed.add_field(name="Claimed By", value=self.claimed_by.value, inline=False)
         embed.add_field(name="Type", value=self.boat_type, inline=False)
@@ -303,151 +528,26 @@ class BoatTypeView(discord.ui.View):
         self.add_item(BoatTypeSelect())
 
 
-class ResourceAmountModal(discord.ui.Modal):
-    def __init__(self, resource_name):
-        super().__init__(title=f"Update {resource_name.title()}")
-        self.resource_name = resource_name
-
-        self.amount = discord.ui.TextInput(
-            label="Amount",
-            placeholder="Example: 79000",
-            required=True,
-            max_length=20
-        )
-
-        self.add_item(self.amount)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        if not has_access(interaction):
-            await interaction.response.send_message(
-                "You do not have permission to use this bot.",
-                ephemeral=True
-            )
-            return
-
-        await interaction.response.defer(ephemeral=True)
-
-        amount_text = self.amount.value.replace(",", "").strip()
-
-        if not amount_text.isdigit():
-            await interaction.followup.send(
-                "Enter numbers only.",
-                ephemeral=True
-            )
-            return
-
-        amount = int(amount_text)
-
-        cursor.execute("""
-        UPDATE resources
-        SET amount = %s
-        WHERE name = %s
-        """, (amount, self.resource_name.lower()))
-
-        if cursor.rowcount == 0:
-            await interaction.followup.send(
-                "Resource not found.",
-                ephemeral=True
-            )
-            return
-
-        cursor.execute("""
-        SELECT goal
-        FROM resources
-        WHERE name = %s
-        """, (self.resource_name.lower(),))
-
-        row = cursor.fetchone()
-        goal = row[0] if row else 0
-        needed = max(goal - amount, 0)
-
-        embed = discord.Embed(
-            title="Resource Updated",
-            color=discord.Color.green()
-        )
-
-        embed.add_field(name="Resource", value=self.resource_name.title(), inline=False)
-        embed.add_field(name="Amount", value=format_number(amount), inline=False)
-        embed.add_field(name="Goal", value=format_number(goal), inline=False)
-        embed.add_field(name="Still Needed", value=format_number(needed), inline=False)
-
-        await interaction.followup.send(embed=embed, ephemeral=True)
-
-
-class ResourceSelect(discord.ui.Select):
-    def __init__(self, category):
-        self.category = category
-
-        options = [
-            discord.SelectOption(label=item)
-            for item in DEFAULT_RESOURCES[category]["items"]
-        ]
-
-        super().__init__(
-            placeholder=f"Choose {category} resource",
-            min_values=1,
-            max_values=1,
-            options=options
-        )
-
-    async def callback(self, interaction: discord.Interaction):
-        if await block_if_no_access(interaction):
-            return
-
-        await interaction.response.send_modal(
-            ResourceAmountModal(self.values[0])
-        )
-
-
-class ResourceSelectView(discord.ui.View):
-    def __init__(self, category):
-        super().__init__(timeout=180)
-        self.add_item(ResourceSelect(category))
-
-
-class ResourceCategorySelect(discord.ui.Select):
-    def __init__(self):
-        options = [
-            discord.SelectOption(label=category)
-            for category in DEFAULT_RESOURCES.keys()
-        ]
-
-        super().__init__(
-            placeholder="Choose resource category",
-            min_values=1,
-            max_values=1,
-            options=options
-        )
-
-    async def callback(self, interaction: discord.Interaction):
-        if await block_if_no_access(interaction):
-            return
-
-        category = self.values[0]
-
-        embed = discord.Embed(
-            title=f"{category} Resources",
-            description=f"Choose which {category} resource to update.",
-            color=discord.Color.green()
-        )
-
-        await interaction.response.send_message(
-            embed=embed,
-            view=ResourceSelectView(category),
-            ephemeral=True
-        )
-
-
-class ResourceCategoryView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=180)
-        self.add_item(ResourceCategorySelect())
-
-
 @bot.event
 async def on_ready():
     setup_resources()
-    await bot.tree.sync()
+
+    try:
+        for guild in bot.guilds:
+            bot.tree.copy_global_to(guild=guild)
+            guild_synced = await bot.tree.sync(guild=guild)
+            print(
+                f"Guild synced {len(guild_synced)} commands to {guild.name} ({guild.id})",
+                flush=True
+            )
+
+        bot.tree.clear_commands(guild=None)
+        cleared_global = await bot.tree.sync()
+        print(f"Cleared global commands. Global count: {len(cleared_global)}", flush=True)
+
+    except Exception as error:
+        print(f"Sync error: {error}", flush=True)
+
     print(f"{bot.user} is online", flush=True)
 
 
@@ -469,7 +569,7 @@ async def on_message(message):
                 async with message.channel.typing():
                     reply = await make_doggo_reply(message.content)
 
-                await message.reply(reply)
+                await send_temp_reply(message, reply)
 
         except Exception as error:
             print(f"Reply handler error: {error}", flush=True)
@@ -484,7 +584,7 @@ async def doggo(interaction: discord.Interaction, message: str):
 
     await interaction.response.defer()
     reply = await make_doggo_reply(message)
-    await interaction.followup.send(reply)
+    await send_temp_followup(interaction, reply)
 
 
 @bot.tree.command(name="registerboat", description="Register a boat")
@@ -519,11 +619,10 @@ async def boats(interaction: discord.Interaction):
     FROM boats
     ORDER BY claimed_by, boat_name
     """)
-
     rows = cursor.fetchall()
 
     if not rows:
-        await interaction.followup.send("No boats registered yet.")
+        await send_temp_followup(interaction, "No boats registered yet.")
         return
 
     grouped = {}
@@ -537,7 +636,7 @@ async def boats(interaction: discord.Interaction):
         message += f"{owner}\n"
 
         for boat_name, boat_type, notes in boats_list:
-            message += f"• {boat_name}, {boat_type}"
+            message += f"â¢ {boat_name}, {boat_type}"
 
             if notes and notes != "None":
                 message += f", {notes}"
@@ -546,7 +645,8 @@ async def boats(interaction: discord.Interaction):
 
         message += "\n"
 
-    await interaction.followup.send(message[:2000])
+    for chunk in split_message(message):
+        await send_temp_followup(interaction, chunk)
 
 
 @bot.tree.command(name="boatsby", description="Show boats claimed by a person")
@@ -562,26 +662,24 @@ async def boatsby(interaction: discord.Interaction, claimed_by: str):
     WHERE lower(claimed_by) = %s
     ORDER BY boat_name
     """, (claimed_by.lower(),))
-
     rows = cursor.fetchall()
 
     if not rows:
-        await interaction.followup.send(
-            f"No boats found for {claimed_by}."
-        )
+        await send_temp_followup(interaction, f"No boats found for {claimed_by}.")
         return
 
     message = f"BOATS CLAIMED BY {claimed_by}\n\n"
 
     for boat_name, boat_type, notes in rows:
-        message += f"• {boat_name}, {boat_type}"
+        message += f"â¢ {boat_name}, {boat_type}"
 
         if notes and notes != "None":
             message += f", {notes}"
 
         message += "\n"
 
-    await interaction.followup.send(message[:2000])
+    for chunk in split_message(message):
+        await send_temp_followup(interaction, chunk)
 
 
 @bot.tree.command(name="removeboat", description="Remove a boat by name")
@@ -597,88 +695,69 @@ async def removeboat(interaction: discord.Interaction, boat_name: str):
     )
 
     if cursor.rowcount == 0:
-        await interaction.followup.send("Boat not found.")
+        await send_temp_followup(interaction, "Boat not found.")
     else:
-        await interaction.followup.send(f"Removed boat: {boat_name}")
+        await send_temp_followup(interaction, f"Removed boat: {boat_name}")
 
 
-@bot.tree.command(name="updateresource", description="Update one resource with dropdowns")
-async def updateresource(interaction: discord.Interaction):
+@bot.tree.command(name="scanresources", description="Update resources from a screenshot")
+async def scanresources(interaction: discord.Interaction, image: discord.Attachment):
     if await block_if_no_access(interaction):
         return
 
-    await interaction.response.defer(ephemeral=True)
-
-    embed = discord.Embed(
-        title="Update Resource",
-        description="Choose a category, then choose the resource. After that, enter the number.",
-        color=discord.Color.green()
-    )
-
-    await interaction.followup.send(
-        embed=embed,
-        view=ResourceCategoryView(),
-        ephemeral=True
-    )
-
-
-@bot.tree.command(name="bulkupdate", description="Update many resources at once")
-@app_commands.describe(
-    updates="Example: Ironwood=79000, Ash=44000, Gold=150000"
-)
-async def bulkupdate(interaction: discord.Interaction, updates: str):
-    if await block_if_no_access(interaction):
+    if not image.content_type or not image.content_type.startswith("image/"):
+        await interaction.response.send_message(
+            "Upload an image file.",
+            ephemeral=True
+        )
         return
 
     await interaction.response.defer()
 
-    lines = updates.replace(",", "\n").split("\n")
+    try:
+        image_bytes = await image.read()
+        scan_data = await scan_resource_image(image_bytes, image.content_type)
+        updated, not_tracked, invalid = update_resources_from_scan(scan_data)
 
-    updated = []
-    not_found = []
+        if not updated and not not_tracked and not invalid:
+            await send_temp_followup(
+                interaction,
+                "I could not read any tracked resources from that screenshot."
+            )
+            return
 
-    for line in lines:
-        if "=" not in line:
-            continue
+        message = "RESOURCE SCREENSHOT SCAN COMPLETE\n\n"
 
-        name, amount = line.split("=", 1)
-        name = name.strip().lower()
-        amount = amount.strip().replace(",", "")
+        if updated:
+            message += f"Updated {len(updated)} resources:\n"
 
-        if not amount.isdigit():
-            continue
+            for name, amount in sorted(updated):
+                message += f"â¢ {name}: {format_number(amount)}\n"
 
-        amount = int(amount)
+        if not_tracked:
+            message += "\nNot tracked or not matched:\n"
 
-        cursor.execute("""
-        UPDATE resources
-        SET amount = %s
-        WHERE name = %s
-        """, (amount, name))
+            for name in sorted(set(not_tracked)):
+                message += f"â¢ {name}\n"
 
-        if cursor.rowcount == 0:
-            not_found.append(name.title())
-        else:
-            updated.append(f"{name.title()} = {format_number(amount)}")
+        if invalid:
+            message += "\nCould not read amount for:\n"
 
-    message = "Resource update complete.\n\n"
+            for name in sorted(set(invalid)):
+                message += f"â¢ {name}\n"
 
-    if updated:
-        message += "Updated:\n"
+        message += "\n"
+        message += build_low_resource_message(ping=False)
 
-        for item in updated:
-            message += f"• {item}\n"
+        for chunk in split_message(message):
+            await send_temp_followup(interaction, chunk)
 
-    if not_found:
-        message += "\nNot found:\n"
-
-        for item in not_found:
-            message += f"• {item}\n"
-
-    message += "\n"
-    message += build_low_resource_message(ping=False)
-
-    await interaction.followup.send(message[:2000])
+    except Exception as error:
+        print(f"Scan resource error: {error}", flush=True)
+        await send_temp_followup(
+            interaction,
+            "I could not scan that screenshot. Try a clearer image with the resource names and amounts visible."
+        )
 
 
 @bot.tree.command(name="resources", description="Show all tracked resources")
@@ -693,7 +772,6 @@ async def resources(interaction: discord.Interaction):
     FROM resources
     ORDER BY category, name
     """)
-
     rows = cursor.fetchall()
     grouped = {}
 
@@ -706,11 +784,12 @@ async def resources(interaction: discord.Interaction):
         message += f"{category.upper()}\n"
 
         for name, goal, amount in items:
-            message += f"• {name}: {format_number(amount)} / {format_number(goal)}\n"
+            message += f"â¢ {name}: {format_number(amount)} / {format_number(goal)}\n"
 
         message += "\n"
 
-    await interaction.followup.send(message[:2000])
+    for chunk in split_message(message):
+        await send_temp_followup(interaction, chunk)
 
 
 @bot.tree.command(name="lowresources", description="Show resources below goal")
@@ -719,10 +798,10 @@ async def lowresources(interaction: discord.Interaction):
         return
 
     await interaction.response.defer()
+    message = build_low_resource_message(ping=False)
 
-    await interaction.followup.send(
-        build_low_resource_message(ping=False)[:2000]
-    )
+    for chunk in split_message(message):
+        await send_temp_followup(interaction, chunk)
 
 
 @bot.tree.command(name="pinglowresources", description="Ping company members for low resources")
@@ -732,10 +811,15 @@ async def pinglowresources(interaction: discord.Interaction):
 
     await interaction.response.defer()
 
-    await interaction.followup.send(
-        build_low_resource_message(ping=True)[:2000],
-        allowed_mentions=discord.AllowedMentions(roles=True)
-    )
+    message = build_low_resource_message(ping=True)
+    chunks = split_message(message)
+
+    for index, chunk in enumerate(chunks):
+        sent = await interaction.followup.send(
+            chunk,
+            allowed_mentions=discord.AllowedMentions(roles=True if index == 0 else False)
+        )
+        asyncio.create_task(delete_after_two_minutes(sent))
 
 
 @bot.tree.command(name="setresourcegoal", description="Change the goal for a resource")
@@ -751,14 +835,15 @@ async def setresourcegoal(
 
     cursor.execute("""
     UPDATE resources
-    SET goal = %s 
+    SET goal = %s
     WHERE name = %s
     """, (goal, resource_name.lower()))
 
     if cursor.rowcount == 0:
-        await interaction.followup.send("Resource not found.")
+        await send_temp_followup(interaction, "Resource not found.")
     else:
-        await interaction.followup.send(
+        await send_temp_followup(
+            interaction,
             f"{resource_name.title()} goal set to {format_number(goal)}."
         )
 
