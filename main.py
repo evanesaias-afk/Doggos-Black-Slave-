@@ -305,7 +305,7 @@ class BoatTypeView(discord.ui.View):
 
 class ResourceAmountModal(discord.ui.Modal):
     def __init__(self, resource_name):
-        super().__init__(title="Update Resource")
+        super().__init__(title=f"Update {resource_name.title()}")
         self.resource_name = resource_name
 
         self.amount = discord.ui.TextInput(
@@ -379,10 +379,7 @@ class ResourceSelect(discord.ui.Select):
         self.category = category
 
         options = [
-            discord.SelectOption(
-                label=item,
-                value=item.lower()
-            )
+            discord.SelectOption(label=item)
             for item in DEFAULT_RESOURCES[category]["items"]
         ]
 
@@ -394,18 +391,13 @@ class ResourceSelect(discord.ui.Select):
         )
 
     async def callback(self, interaction: discord.Interaction):
-        if not has_access(interaction):
-            await interaction.response.send_message(
-                "You do not have permission to use this bot.",
-                ephemeral=True
-            )
+        if await block_if_no_access(interaction):
             return
 
-        resource_name = self.values[0]
-
         await interaction.response.send_modal(
-            ResourceAmountModal(resource_name)
+            ResourceAmountModal(self.values[0])
         )
+
 
 class ResourceSelectView(discord.ui.View):
     def __init__(self, category):
@@ -428,11 +420,7 @@ class ResourceCategorySelect(discord.ui.Select):
         )
 
     async def callback(self, interaction: discord.Interaction):
-        if not has_access(interaction):
-            await interaction.response.send_message(
-                "You do not have permission to use this bot.",
-                ephemeral=True
-            )
+        if await block_if_no_access(interaction):
             return
 
         category = self.values[0]
@@ -449,6 +437,7 @@ class ResourceCategorySelect(discord.ui.Select):
             ephemeral=True
         )
 
+
 class ResourceCategoryView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=180)
@@ -458,22 +447,7 @@ class ResourceCategoryView(discord.ui.View):
 @bot.event
 async def on_ready():
     setup_resources()
-
-    try:
-        global_synced = await bot.tree.sync()
-        print(f"Global synced {len(global_synced)} commands", flush=True)
-
-        for guild in bot.guilds:
-            bot.tree.copy_global_to(guild=guild)
-            guild_synced = await bot.tree.sync(guild=guild)
-            print(
-                f"Guild synced {len(guild_synced)} commands to {guild.name} ({guild.id})",
-                flush=True
-            )
-
-    except Exception as error:
-        print(f"Sync error: {error}", flush=True)
-
+    await bot.tree.sync()
     print(f"{bot.user} is online", flush=True)
 
 
@@ -628,8 +602,8 @@ async def removeboat(interaction: discord.Interaction, boat_name: str):
         await interaction.followup.send(f"Removed boat: {boat_name}")
 
 
-@bot.tree.command(name="bulkupdate", description="Update a resource with dropdowns")
-async def bulkupdate(interaction: discord.Interaction):
+@bot.tree.command(name="updateresource", description="Update one resource with dropdowns")
+async def updateresource(interaction: discord.Interaction):
     if await block_if_no_access(interaction):
         return
 
@@ -646,6 +620,65 @@ async def bulkupdate(interaction: discord.Interaction):
         view=ResourceCategoryView(),
         ephemeral=True
     )
+
+
+@bot.tree.command(name="bulkupdate", description="Update many resources at once")
+@app_commands.describe(
+    updates="Example: Ironwood=79000, Ash=44000, Gold=150000"
+)
+async def bulkupdate(interaction: discord.Interaction, updates: str):
+    if await block_if_no_access(interaction):
+        return
+
+    await interaction.response.defer()
+
+    lines = updates.replace(",", "\n").split("\n")
+
+    updated = []
+    not_found = []
+
+    for line in lines:
+        if "=" not in line:
+            continue
+
+        name, amount = line.split("=", 1)
+        name = name.strip().lower()
+        amount = amount.strip().replace(",", "")
+
+        if not amount.isdigit():
+            continue
+
+        amount = int(amount)
+
+        cursor.execute("""
+        UPDATE resources
+        SET amount = %s
+        WHERE name = %s
+        """, (amount, name))
+
+        if cursor.rowcount == 0:
+            not_found.append(name.title())
+        else:
+            updated.append(f"{name.title()} = {format_number(amount)}")
+
+    message = "Resource update complete.\n\n"
+
+    if updated:
+        message += "Updated:\n"
+
+        for item in updated:
+            message += f"• {item}\n"
+
+    if not_found:
+        message += "\nNot found:\n"
+
+        for item in not_found:
+            message += f"• {item}\n"
+
+    message += "\n"
+    message += build_low_resource_message(ping=False)
+
+    await interaction.followup.send(message[:2000])
 
 
 @bot.tree.command(name="resources", description="Show all tracked resources")
@@ -718,7 +751,7 @@ async def setresourcegoal(
 
     cursor.execute("""
     UPDATE resources
-    SET goal = %s
+    SET goal = %s 
     WHERE name = %s
     """, (goal, resource_name.lower()))
 
